@@ -1,7 +1,7 @@
 # Per-key builder configuration: a walkthrough from the simplest config up
 
-> **Status.** Reflects three open PRs at these commits: keymanager-APIs @`e2213e6`,
-> beacon-APIs @`3f886eb` (#630), builder-specs @`f99faf8` (#165). These branches are still moving; when a
+> **Status.** Reflects three open PRs at these commits: keymanager-APIs @`b647dd9`,
+> beacon-APIs @`ea9bafb` (#630), builder-specs @`25fa22b` (#165). These branches are still moving; when a
 > spec changes, this doc is stale until updated. The specs are authoritative: where this doc and a spec
 > disagree, the spec wins.
 
@@ -14,10 +14,12 @@ The three specs it traces:
 
 - **Keymanager API**: how an operator programs a validator key's builder configuration.
 - **Beacon API**: how the validator client hands that configuration to the beacon node when asking for a
-  block (`produceBlockV4`), and how it publishes the result (`publishBlockV2` for the signed block, plus the
-  execution-payload-envelope endpoints).
+  block (`produceBlockV4`), how it submits builder preferences for the beacon node to fan out
+  (`submitBuilderPreferences`), and how it publishes the result (`publishBlockV2` for the signed block, plus
+  the execution-payload-envelope endpoints).
 - **Builder API** (`getExecutionPayloadBid`, `submitBuilderPreferences`, `submitSignedBeaconBlock`): how the
-  beacon node talks to builders.
+  beacon node talks to builders. Note `submitBuilderPreferences` exists on both APIs: the beacon-API call is
+  the batched VC-to-BN hop, the builder-API call is the per-builder BN-to-builder hop it fans out into.
 
 The doc is organized as a progression. It starts from the simplest possible configuration and layers complexity one example at a time. Each later example
 explains only what is new relative to the one before it.
@@ -177,14 +179,17 @@ So by the time a url-bearing entry reaches `produceBlockV4` it MUST carry its `a
 a bid request for one that lacks it. The VC bridges the two layers: it resolves `auth_data` and constructs the
 signed `auth` before the beacon call.
 
-The VC builds and signs the `auth` (a `SignedRequestAuthV1`, a `message` of `{data, slot}` plus a
-`signature`) per entry, per slot; the BN forwards it byte-for-byte and does not sign:
+The VC builds and signs the `auth` (a `SignedRequestAuth`, a `message` of `{data, slot}` plus a
+`signature`) per entry, per slot; the BN forwards it byte-for-byte and does not sign. Two senses of
+"fork-versioned" pull apart here and both are worth stating up front: the **signing domain** is not
+fork-versioned (it uses genesis defaults, below), but the **wire type** is, so any request that carries the
+`auth` also carries an `Eth-Consensus-Version` header naming the fork whose `RequestAuth` schema it encodes:
 
 ```python
 def sign_request_auth(auth_data, slot, validator_privkey):
-    # NOT fork-versioned: genesis fork version + zero root; never reuse DOMAIN_BEACON_BUILDER
+    # signing domain: genesis fork version + zero root (NOT fork-versioned); never reuse DOMAIN_BEACON_BUILDER
     domain = compute_domain(DOMAIN_REQUEST_AUTH)
-    message = RequestAuthMessage(data=auth_data, slot=slot)
+    message = RequestAuth(data=auth_data, slot=slot)
     signing_root = compute_signing_root(message, domain)
     return bls.Sign(validator_privkey, signing_root)
 ```
@@ -198,13 +203,28 @@ produce the byte-identical string.
 
 ### Communicating preferences
 
-The first place the auth is used is `submitBuilderPreferences`, sent per proposer key ahead of the proposal
-slot so the builder has time to apply the preferences to its bid (for example, an epoch before). The auth
-binds the preference request to the real proposer, not an imposter. The call authenticates with a
-`SignedRequestAuthV1`; its `auth.message.slot` is the proposal slot the preferences apply to, and the builder
-rejects a submission whose slot has **already passed** (`400`), which stops a replay from rolling preferences
-back. Signature failure is `401`, a `data` mismatch is `400`. The call is per-builder and best-effort: each
-addressed builder responds `202`, `400`, or `401` individually, with no aggregate result defined.
+The first place the auth is used is `submitBuilderPreferences`, sent ahead of the proposal slot so the
+builder has time to apply the preferences to its bid (for example, an epoch before). It travels in two hops,
+and the same name is used for both:
+
+- **VC to BN, batched (beacon API).** The VC POSTs a flat array of `BuilderPreferencesEntry` to
+  `/eth/v1/validator/builder_preferences`, one entry per builder per proposer, each naming the proposer it
+  applies to in its `proposer_pubkey` field. `BuilderPreferencesEntry` is a dedicated type —
+  `{proposer_pubkey, url, max_execution_payment, auth}` — distinct from the block-production `BuilderEntry`.
+  Every entry carries a `url` (the builder it targets), and the `Eth-Consensus-Version` header is required. The BN responds `200` when every entry was submitted and its
+  builder accepted it, or `400` with an `IndexedErrorMessage` that reports each failed entry by its index,
+  proxying the builder's error for that entry, while still submitting the others.
+- **BN to builder, per-builder (builder API).** For each entry the BN makes one builder-API
+  `submitBuilderPreferences` call to `.../builder_preferences/{proposer_pubkey}` — the proposer pubkey rides
+  in the **path** (symmetric with `getExecutionPayloadBid`), not the body. The body is a
+  `BuilderPreferencesRequest` of just `{auth, preferences}`, where `preferences` carries the
+  `max_execution_payment`. Each addressed builder responds `202`, `400`, or `401` individually and
+  best-effort, and the BN maps those results back onto the batched response above.
+
+The auth binds each preference request to the real proposer, not an imposter. Its `auth.message.slot` is the
+proposal slot the preferences apply to, and the builder rejects a submission whose slot has **already
+passed** (`400`), which stops a replay from rolling preferences back. Signature failure is `401`, a `data`
+mismatch is `400`.
 
 For v1, the only preference it carries is `max_execution_payment`, the cap on the **trusted** portion of a bid
 (`execution_payment`). `"0"` accepts no trusted payment, requiring the whole payment to be trustless;
@@ -220,8 +240,9 @@ For v1, the only preference it carries is `max_execution_payment`, the cap on th
 
 With preferences in place, the BN requests a bid on the proposer's behalf. `getExecutionPayloadBid` is a
 `POST` to `.../execution_payload_bid/{slot}/{parent_hash}/{parent_root}/{proposer_pubkey}` with the
-`SignedRequestAuthV1` as the body and two **required** headers, `Date-Milliseconds` (the Unix ms the request
-was sent) and `X-Timeout-Ms` (the proposer's timeout, measured from `Date-Milliseconds`). The builder is
+`SignedRequestAuth` as the body and three **required** headers: `Eth-Consensus-Version` (the fork whose
+`RequestAuth` schema the body uses, since the type is fork-versioned), `Date-Milliseconds` (the Unix ms the
+request was sent), and `X-Timeout-Ms` (the proposer's timeout, measured from `Date-Milliseconds`). The builder is
 expected to honor its stored preferences, and MUST respond by `Date-Milliseconds + X-Timeout-Ms`; a later
 response is discarded, so a slow bid is a lost bid even at `200`. The builder:
 
@@ -494,4 +515,4 @@ The rules most easily gotten wrong:
 | 4 | SSZ absence sentinels: zero-length `url`, all-zero `builder_pubkey`, zeroed `auth` | SSZ has no absence, so unset must be a sentinel value, and the JSON and SSZ forms must agree on what an entry means | beacon |
 | 5 | The same builder on both channels needs two entries | A URL entry's `builder_pubkey` only filters its own bid; it never sets p2p policy, so covering p2p needs a second, url-less entry | beacon |
 | 6 | Top-level `min_bid`/`builder_boost_factor` apply only to a bid matching no entry | There is no top-level `max_execution_payment` because a p2p bid carries no trusted `execution_payment` (consensus forces it to `0`) | beacon |
-| 7 | Request auth is NOT fork-versioned | Use `compute_domain(DOMAIN_REQUEST_AUTH)` with genesis defaults; fork-versioning it or reusing `DOMAIN_BEACON_BUILDER` makes signatures fail across clients | builder |
+| 7 | Request auth: genesis **signing domain**, fork-versioned **wire type** | Sign under `compute_domain(DOMAIN_REQUEST_AUTH)` with genesis defaults (never the active fork version, never `DOMAIN_BEACON_BUILDER`), yet the SSZ type is fork-versioned, so `getExecutionPayloadBid` and `submitBuilderPreferences` require the `Eth-Consensus-Version` header | builder |
