@@ -1,7 +1,7 @@
 # Per-key builder configuration: a walkthrough from the simplest config up
 
-> **Status.** Reflects three open PRs at these commits: keymanager-APIs @`b647dd9`,
-> beacon-APIs @`ea9bafb` (#630), builder-specs @`25fa22b` (#165). These branches are still moving; when a
+> **Status.** Reflects three open PRs at these commits: keymanager-APIs @`a29a3f7`,
+> beacon-APIs @`91db6c8` (#630), builder-specs @`36cefe4` (#165). These branches are still moving; when a
 > spec changes, this doc is stale until updated. The specs are authoritative: where this doc and a spec
 > disagree, the spec wins.
 
