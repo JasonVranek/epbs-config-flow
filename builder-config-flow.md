@@ -1,7 +1,7 @@
 # Per-key builder configuration: a walkthrough from the simplest config up
 
-> **Status.** Reflects three open PRs at these commits: keymanager-APIs @`a29a3f7`,
-> beacon-APIs @`91db6c8` (#630), builder-specs @`36cefe4` (#165). These branches are still moving; when a
+> **Status.** Reflects three open PRs at these commits: keymanager-APIs @`8da225a`,
+> beacon-APIs @`97c1cd9` (#630), builder-specs @`36cefe4` (#165). These branches are still moving; when a
 > spec changes, this doc is stale until updated. The specs are authoritative: where this doc and a spec
 > disagree, the spec wins.
 
@@ -31,7 +31,8 @@ explains only what is new relative to the one before it.
 - [Example 2: add p2p bids](#example-2-add-p2p-bids)
 - [Example 3: add one builder-API connection](#example-3-add-one-builder-api-connection)
 - [Example 4: multiple connections and fallbacks](#example-4-multiple-connections-and-fallbacks)
-- [Example 5: edge-case configs](#example-5-edge-case-configs)- [Open questions and out of scope](#open-questions-and-out-of-scope)
+- [Example 5: edge-case configs](#example-5-edge-case-configs)
+- [Open questions and out of scope](#open-questions-and-out-of-scope)
 - [Appendix: more footgun rules](#appendix-more-footgun-rules)
 
 ## The cast
@@ -75,39 +76,16 @@ Configure this at the keymanager with `enabled: true` and an empty `builders` li
 {
   "enabled": true,
   "builders": [],                // no builder-API bids requested; p2p is the only source
-  "min_bid": "10000000",         // default floor for a bid matching no entry (Gwei)
-  "builder_boost_factor": "110"  // default boost for a bid matching no entry; 100 is 1.0x
+  "min_bid": "10000000",         // floor for p2p bids (Gwei)
+  "builder_boost_factor": "110"  // boost for p2p bids; 100 is 1.0x
 }
 ```
 
 An empty `builders` array requests no builder-API bids, so the only bids considered are those arriving over
-p2p. The top-level `min_bid` and `builder_boost_factor` are the defaults for any bid no entry covers, which
-here is every p2p bid.
+p2p.
 
 If you implemented the pre-Gloas `produceBlockV3`, note that `builder_boost_factor` was a query parameter
 there; Gloas moves the bid-selection knobs into this `BuilderConfig` body.
-
-### Per-builder p2p constraints
-
-`builders` is not only for configuring builder-API calls. An entry that names a `builder_pubkey` but requests
-no bid sets policy for that one builder's p2p bids, overriding the top-level defaults:
-
-```jsonc
-// keymanager POST body
-{
-  "enabled": true,
-  "builders": [
-    { "builder_pubkey": "0xa1b2...",     // applies to this builder's p2p bids only
-      "min_bid": "50000000",
-      "builder_boost_factor": "150" }
-  ],
-  "min_bid": "10000000",                 // default for every other p2p bid
-  "builder_boost_factor": "110"
-}
-```
-
-A p2p bid from `0xa1b2...` is held to that entry's `min_bid` and `builder_boost_factor`; every other p2p bid
-falls to the top-level defaults.
 
 ### The floor and the boost
 
@@ -121,23 +99,12 @@ These two fields set how a bid's value is weighed against the local build:
   above 100 favors the bid. The highest boosted bid competes with the local build **in Gwei**, and the local
   build wins a tie.
 
-### How a p2p bid is matched
-
-A p2p bid arrives over gossip. The BN decides which values apply by resolving the bid's `builder_index`
-through the builder registry to a builder pubkey, then looking for an entry in the request body that names
-that pubkey and requests no bid. If one matches, its `min_bid` and `builder_boost_factor` apply; otherwise the
-bid falls to the top-level defaults.
-
-`max_execution_payment` has no top-level counterpart and never constrains a p2p bid: consensus already
-forces a p2p bid's `execution_payment` to `0`, so there is nothing to cap.
-
 ---
 
 ## Example 3: add one builder-API connection
 
-Now the proposer connects directly to one builder at its URL. Adding a `url` to an entry is what makes it a
-builder-API bid request: the beacon node calls that builder at the `url` for a bid. An entry without a `url`,
-like Example 2's, only sets p2p policy.
+Now the proposer connects directly to one builder at its URL: the beacon node calls the builder at the
+entry's `url` for a bid.
 
 The keymanager body the staking software POSTs for one trustless direct connection:
 
@@ -154,8 +121,9 @@ The keymanager body the staking software POSTs for one trustless direct connecti
 
 The staking software `POST`s this `BuilderConfig` to the VC at `/eth/v1/validator/{pubkey}/builders` (`202`). The submission **replaces** the key's
 stored config in full; the server does not merge with what was there before. Note what is absent from the
-entry: no `auth_data`, no `builder_pubkey`, no per-entry `min_bid` or `builder_boost_factor`. These are optional in the keymanager body, so each is
-resolved by the VC before anything reaches the beacon node.
+entry: no `auth_data`, no `builder_pubkey`, no per-entry `min_bid` or `builder_boost_factor`. These are
+optional in the keymanager body, and the VC resolves all but `builder_pubkey` before anything reaches the
+beacon node.
 
 ### Tracing the three interfaces
 
@@ -164,20 +132,18 @@ resolved by the VC before anything reaches the beacon node.
    field is present. The VC fills in `min_bid`, `builder_boost_factor`, `max_execution_payment`, and
    `auth_data` from its own configuration where the entry omitted them.
 3. **Beacon `produceBlockV4`.** The VC calls `produceBlockV4` with the resolved `BuilderConfig` in the body.
-   For each entry that names a URL the BN calls `getExecutionPayloadBid` at that entry's `url`, forwarding
-   the entry's `auth`.
+   For each entry the BN calls `getExecutionPayloadBid` at that entry's `url`, forwarding the entry's
+   `auth`.
 
 ### Request authentication
 
 A request auth lets a builder confirm it is talking to the actual proposer over a direct builder-API
-connection. It exists only for a `BuilderEntry` that carries a `url`, since it authenticates that entry's bid
-request; a url-less (p2p) entry has none.
+connection.
 
 Tracing the field down the stack: the keymanager body may leave `auth_data` unset (the example above does),
 but the builder-API requires the bid request to be authenticated, and a beacon-side entry is fully resolved.
-So by the time a url-bearing entry reaches `produceBlockV4` it MUST carry its `auth`, and the BN MUST NOT send
-a bid request for one that lacks it. The VC bridges the two layers: it resolves `auth_data` and constructs the
-signed `auth` before the beacon call.
+So by the time an entry reaches `produceBlockV4` it carries its `auth`. The VC bridges the two layers: it
+resolves `auth_data` and constructs the signed `auth` before the beacon call.
 
 The VC builds and signs the `auth` (a `SignedRequestAuth`, a `message` of `{data, slot}` plus a
 `signature`) per entry, per slot; the BN forwards it byte-for-byte and does not sign. Two senses of
@@ -275,9 +241,9 @@ def evaluate(bid, min_bid, max_exec_payment, boost):
     return boost * (total // 100)                             # boost, on total (divide first)
 ```
 
-### `builder_pubkey` on a URL entry filters the response
+### `builder_pubkey` filters the response
 
-The `builder_pubkey` filter is optional. If the URL entry carries one, it **filters the response**: a bid that
+The `builder_pubkey` filter is optional. If an entry carries one, it **filters the response**: a bid that
 comes back not signed by the expected builder MUST NOT be accepted. A correctly-signed bid from an unexpected
 builder is dropped, not an error. This matters because you are allowing a trusted payment: if you want to bound
 that trust to a specific entity, it may extend only to a specific builder and not to the URL, since one URL can
@@ -313,17 +279,12 @@ bid-win path stateless for multi-BN and failover setups.
 
 ## Example 4: multiple connections and fallbacks
 
-Now several entries at once, mixing builder-API and p2p, with per-entry overrides. Only the diffs from Example
-3 follow.
+Now several entries at once, with per-entry overrides. Only the diffs from Example 3 follow.
 
 ### Uniqueness rules
 
-An entry's identity depends on whether it names a URL:
-
-- An entry **with** a `url` is a bid request. No two may share both the same `url` **and** the same
-  `auth_data` (compared as decoded bytes, so hex case does not distinguish, and an omitted `auth_data` is
-  compared as the value the VC would derive).
-- An entry **without** a `url` supplies p2p policy. No two may share the same `builder_pubkey`.
+No two entries may share both the same `url` **and** the same `auth_data` (compared as decoded bytes, so
+hex case does not distinguish, and an omitted `auth_data` is compared as the value the VC would derive).
 
 A `url` can be an intermediary that fronts several builders rather than a builder's own address, with the
 `auth_data` carrying the routing that selects which builder behind it a request is for. Reaching them all
@@ -340,30 +301,6 @@ only forbids sharing both, which would just send the identical request twice.
 ]
 ```
 
-The beacon node is more lenient on the p2p side: duplicate `builder_pubkey` url-less entries are not an
-error, it applies the first and ignores the rest rather than failing the block-production request.
-
-### The same builder on both channels
-
-p2p policy comes **only** from entries with no `url`. An entry with **both** a `url` and a `builder_pubkey`
-does not set p2p policy; its `builder_pubkey` only filters the requested response. To set policy for the same
-builder `B` on both channels you need two entries:
-
-```jsonc
-// keymanager builders
-"builders": [
-  { "url": "https://builder-b.example.com",
-    "builder_pubkey": "0xB...",
-    "max_execution_payment": "250000000" },  // per-entry: this builder's trusted-payment cap (0.25 ETH)
-  { "builder_pubkey": "0xB...",
-    "min_bid": "10000000" }                   // per-entry: this builder's p2p floor
-]
-```
-
-The first requests a bid from the URL and checks it was signed by `B`, accepting a trusted payment up to 0.25
-ETH. The second, URL-less, applies p2p policy to `B`'s gossiped bids. They do not collide under the uniqueness
-rules, since one is URL-bearing and one is not.
-
 ### Per-entry vs per-config `min_bid` and `builder_boost_factor`
 
 `min_bid` and `builder_boost_factor` keep the same two names at two structural scopes; the scope tells you
@@ -378,7 +315,7 @@ which value you are looking at. Shown inline:
       "builder_pubkey": "0xB...",
       "min_bid": "20000000",            // per-entry: applies to B's builder-API bid
       "builder_boost_factor": "120" },  // per-entry: applies to B's builder-API bid
-    { "builder_pubkey": "0xD..." }      // no per-entry knobs; inherits the per-config defaults below
+    { "url": "https://builder-d.example.com" }  // no per-entry knobs; inherits the per-config defaults below
   ],
   "min_bid": "10000000",                // per-config default (see Inheritance and defaults)
   "builder_boost_factor": "100"         // per-config default (see Inheritance and defaults)
@@ -386,8 +323,7 @@ which value you are looking at. Shown inline:
 ```
 
 A per-entry value applies to that entry's bid. The top-level per-config value is the key's default for that
-field, used two ways: an entry that omits its own value inherits it (any entry, not only p2p), and a bid from
-a builder with no entry at all falls back to it (a p2p bid matching no entry).
+field, used two ways: an entry that omits its own value inherits it, and p2p bids take it.
 
 ### Inheritance and defaults
 
@@ -444,16 +380,7 @@ per entry, agreed out of band. The URL-derived default is enough only when the U
 ### SSZ absence sentinels
 
 In JSON an optional field is simply absent. SSZ has no absence: every field in the container is always
-present, so each optional field needs a value that **means** unset:
-
-- `url`: zero length.
-- `builder_pubkey`: all zero (not a valid BLS key).
-- `auth`: a `data` of zero length **and** an all-zero `signature`.
-
-The JSON and SSZ forms must agree on what an entry means, so these sentinels must be used. The
-`auth`-required-when-`url`-present rule is stated in prose, not in the schema's `required` list, because it is
-conditional: neither JSON Schema's `required` nor SSZ can express a field that is required only when another
-is present.
+present, so unset must be a sentinel value: `builder_pubkey` is all zero (not a valid BLS key).
 
 ### `enabled: false`, `DELETE`, and the four ways to say "fewer builders"
 
@@ -479,7 +406,7 @@ Four distinct states, not synonyms:
 
 `GET /eth/v1/validator/{pubkey}/builders` returns the configuration **in effect** (`200`), with omitted values **resolved**: an entry that omitted a field
 comes back with the value that will actually be used. This matters for read-modify-write. If you `GET`, tweak
-one field, and `POST` the result back, every previously-omitted field is now an **explicit** value, and those
+one field, and `POST` the result back, every field the VC resolves is now an **explicit** value, and those
 entries no longer track the defaults. To keep an entry tracking the key default, omit the field on the way
 back in; do not echo the resolved value.
 
@@ -511,8 +438,6 @@ The rules most easily gotten wrong:
 | --- | --- | --- | --- |
 | 1 | Resolution is 3-tier for `min_bid`/`builder_boost_factor` (entry, key default, VC config), 2-tier for `max_execution_payment`/`auth_data` | An entry that omits a field inherits the **key** default, not the VC global; "I left it blank" does not mean "use the client default" | keymanager |
 | 2 | Omitted `auth_data` is VC-derived from the URL and byte-matched at the builder | The URL-derived value is identical for every builder behind a shared URL, so it cannot tell them apart; set an explicit, distinct `auth_data` per builder | keymanager, builder |
-| 3 | `auth` required when `url` present, in prose only | JSON Schema's `required` cannot express a conditional field, so nothing enforces it; the BN simply does not send a bid for a URL entry lacking `auth` | beacon |
-| 4 | SSZ absence sentinels: zero-length `url`, all-zero `builder_pubkey`, zeroed `auth` | SSZ has no absence, so unset must be a sentinel value, and the JSON and SSZ forms must agree on what an entry means | beacon |
-| 5 | The same builder on both channels needs two entries | A URL entry's `builder_pubkey` only filters its own bid; it never sets p2p policy, so covering p2p needs a second, url-less entry | beacon |
-| 6 | Top-level `min_bid`/`builder_boost_factor` apply only to a bid matching no entry | There is no top-level `max_execution_payment` because a p2p bid carries no trusted `execution_payment` (consensus forces it to `0`) | beacon |
-| 7 | Request auth: genesis **signing domain**, fork-versioned **wire type** | Sign under `compute_domain(DOMAIN_REQUEST_AUTH)` with genesis defaults (never the active fork version, never `DOMAIN_BEACON_BUILDER`), yet the SSZ type is fork-versioned, so `getExecutionPayloadBid` and `submitBuilderPreferences` require the `Eth-Consensus-Version` header | builder |
+| 3 | SSZ absence sentinel: all-zero `builder_pubkey` | SSZ has no absence, so unset must be a sentinel value, and the JSON and SSZ forms must agree on what an entry means | beacon |
+| 4 | Top-level `min_bid`/`builder_boost_factor` apply to p2p bids | There is no top-level `max_execution_payment` because a p2p bid carries no trusted `execution_payment` (consensus forces it to `0`) | beacon |
+| 5 | Request auth: genesis **signing domain**, fork-versioned **wire type** | Sign under `compute_domain(DOMAIN_REQUEST_AUTH)` with genesis defaults (never the active fork version, never `DOMAIN_BEACON_BUILDER`), yet the SSZ type is fork-versioned, so `getExecutionPayloadBid` and `submitBuilderPreferences` require the `Eth-Consensus-Version` header | builder |
