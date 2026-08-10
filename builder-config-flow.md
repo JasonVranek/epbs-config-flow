@@ -123,16 +123,16 @@ The keymanager body the staking software POSTs for one trustless direct connecti
 
 The staking software `POST`s this `BuilderConfig` to the VC at `/eth/v1/validator/{pubkey}/builders` (`202`). The submission **replaces** the key's
 stored config in full; the server does not merge with what was there before. Note what is absent from the
-entry: no `auth_data`, no `builder_pubkey`, no per-entry `min_bid` or `builder_boost_factor`. These are
-optional in the keymanager body, and the VC resolves all but `builder_pubkey` before anything reaches the
-beacon node.
+entry: no `auth_data`, no `builder_pubkeys`, no per-entry `min_bid` or `builder_boost_factor`. These are
+optional in the keymanager body, and the VC resolves each before anything reaches the beacon node.
 
 ### Tracing the three interfaces
 
 1. **Keymanager POST** (above): the operator programs the key; the VC stores the config.
 2. **The VC resolves every entry field.** Beacon-side entries are fully resolved: on `produceBlockV4` every
    field is present. The VC fills in `min_bid`, `builder_boost_factor`, `max_execution_payment`, and
-   `auth_data` from its own configuration where the entry omitted them.
+   `auth_data` from its own configuration where the entry omitted them; an omitted `builder_pubkeys`
+   resolves to the empty list.
 3. **Beacon `produceBlockV4`.** The VC calls `produceBlockV4` with the resolved `BuilderConfig` in the
    body and the `Eth-Consensus-Version` header. For each entry the BN calls `getExecutionPayloadBid` at
    that entry's `url`, forwarding the entry's `auth`.
@@ -243,12 +243,12 @@ def evaluate(bid, min_bid, max_exec_payment, boost):
     return boost * (total // 100)                             # boost, on total (divide first)
 ```
 
-### `builder_pubkey` filters the response
+### `builder_pubkeys` filters the response
 
-The `builder_pubkey` filter is optional. If an entry carries one, it **filters the response**: a bid that
-comes back not signed by the expected builder MUST NOT be accepted. A correctly-signed bid from an unexpected
-builder is dropped, not an error. This matters because you are allowing a trusted payment: if you want to bound
-that trust to a specific entity, it may extend only to a specific builder and not to the URL, since one URL can
+An empty `builder_pubkeys` list accepts any builder. A non-empty list **filters the response**: a bid that
+comes back not signed by one of the listed builders MUST NOT be accepted. A correctly-signed bid from an
+unlisted builder is dropped, not an error. This matters because you are allowing a trusted payment: if you
+want to bound that trust, it may extend only to specific builders and not to the URL, since one URL can
 front several builders and you may trust only some of them.
 
 Three builder-side MUSTs on the bid relate to the config values: `fee_recipient` MUST equal the fee recipient
@@ -297,9 +297,9 @@ only forbids sharing both, which would just send the identical request twice.
 ```jsonc
 // keymanager builders
 "builders": [
-  { "url": "https://a.example.com", "auth_data": "0x...a", "builder_pubkey": "0xB..." },
-  { "url": "https://a.example.com", "auth_data": "0x...b", "builder_pubkey": "0xC..." },  // ok: same url, different auth_data
-  { "url": "https://a.example.com", "auth_data": "0x...a", "builder_pubkey": "0xB..." }   // 400: duplicate (url, auth_data) of the first
+  { "url": "https://a.example.com", "auth_data": "0x...a", "builder_pubkeys": ["0xB..."] },
+  { "url": "https://a.example.com", "auth_data": "0x...b", "builder_pubkeys": ["0xC..."] },  // ok: same url, different auth_data
+  { "url": "https://a.example.com", "auth_data": "0x...a", "builder_pubkeys": ["0xB..."] }   // 400: duplicate (url, auth_data) of the first
 ]
 ```
 
@@ -313,7 +313,7 @@ which value you are looking at. Shown inline:
 {
   "builders": [
     { "url": "https://builder-b.example.com",
-      "builder_pubkey": "0xB...",
+      "builder_pubkeys": ["0xB..."],
       "min_bid": "20000000",            // per-entry: applies to B's builder-API bid
       "builder_boost_factor": "120" },  // per-entry: applies to B's builder-API bid
     { "url": "https://builder-d.example.com" }  // no per-entry knobs; inherits the per-config defaults below
@@ -336,6 +336,7 @@ only two fields:
   if that is unset too, the VC's own configuration.
 - `max_execution_payment`, `auth_data`: an omitted entry value inherits the VC's own configuration directly;
   there is no key-level default for these.
+- `builder_pubkeys`: an omitted value resolves to the empty list; there is no default to inherit.
 
 The key-level default is the footgun: if an operator sets a key-level `builder_boost_factor` but omits it on
 an entry, the entry inherits the **key default**, not the VC's global. "I left it blank" does not mean "use
@@ -346,7 +347,7 @@ the client default."
 {
   "builders": [
     { "url": "https://builder-b.example.com",
-      "builder_pubkey": "0xB..." }   // omits builder_boost_factor -> inherits 120 (the key default), not the VC global
+      "builder_pubkeys": ["0xB..."] }   // omits builder_boost_factor -> inherits 120 (the key default), not the VC global
   ],
   "builder_boost_factor": "120"      // key-level default
 }
@@ -376,11 +377,6 @@ and "explicit empty" as different, and prefer omitting.
 
 The URL-derived default is the **same** for every builder behind a shared URL, so it cannot tell them apart. To handle that case the operator MUST set an explicit, distinct `auth_data`
 per entry, agreed out of band. The URL-derived default is enough only when the URL fronts a single builder.
-
-### SSZ absence sentinels
-
-In JSON an optional field is simply absent. SSZ has no absence: every field in the container is always
-present, so unset must be a sentinel value: `builder_pubkey` is all zero (not a valid BLS key).
 
 ### `DELETE` and the three ways to say "fewer builders"
 
@@ -439,6 +435,5 @@ The rules most easily gotten wrong:
 | --- | --- | --- | --- |
 | 1 | Resolution is 3-tier for `min_bid`/`builder_boost_factor` (entry, key default, VC config), 2-tier for `max_execution_payment`/`auth_data` | An entry that omits a field inherits the **key** default, not the VC global; "I left it blank" does not mean "use the client default" | keymanager |
 | 2 | Omitted `auth_data` is VC-derived from the URL and byte-matched at the builder | The URL-derived value is identical for every builder behind a shared URL, so it cannot tell them apart; set an explicit, distinct `auth_data` per builder | keymanager, builder |
-| 3 | SSZ absence sentinel: all-zero `builder_pubkey` | SSZ has no absence, so unset must be a sentinel value, and the JSON and SSZ forms must agree on what an entry means | beacon |
-| 4 | Top-level `min_bid`/`builder_boost_factor` apply to p2p bids | There is no top-level `max_execution_payment` because a p2p bid carries no trusted `execution_payment` (consensus forces it to `0`) | beacon |
-| 5 | Request auth: genesis **signing domain**, fork-versioned **wire type** | Sign under `compute_domain(DOMAIN_REQUEST_AUTH)` with genesis defaults (never the active fork version, never `DOMAIN_BEACON_BUILDER`), yet the SSZ type is fork-versioned, so `produceBlockV4`, `getExecutionPayloadBid`, and `submitBuilderPreferences` require the `Eth-Consensus-Version` header | beacon, builder |
+| 3 | Top-level `min_bid`/`builder_boost_factor` apply to p2p bids | There is no top-level `max_execution_payment` because a p2p bid carries no trusted `execution_payment` (consensus forces it to `0`) | beacon |
+| 4 | Request auth: genesis **signing domain**, fork-versioned **wire type** | Sign under `compute_domain(DOMAIN_REQUEST_AUTH)` with genesis defaults (never the active fork version, never `DOMAIN_BEACON_BUILDER`), yet the SSZ type is fork-versioned, so `produceBlockV4`, `getExecutionPayloadBid`, and `submitBuilderPreferences` require the `Eth-Consensus-Version` header | beacon, builder |
