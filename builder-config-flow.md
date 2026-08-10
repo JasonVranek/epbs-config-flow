@@ -363,17 +363,12 @@ cannot use yields no bid but MUST NOT fail the request, so one bad entry never c
 
 ## Example 5: edge-case configs
 
-### Omitted and explicit-empty `auth_data`
+### Omitted `auth_data`
 
 When omitted, `auth_data` is VC-derived from the URL (the SHOULD convention from Example 3: UTF-8 bytes of the
 URL exactly as advertised, hex-encoded). "Exactly as advertised" is the canonicalization rule (no
 normalization); any divergence between what the VC signs and what the builder expects is a `400` at the
-builder.
-
-Two things the spec does not fully pin down, so do not over-rely on them. An **explicit** empty `auth_data`
-(`"0x"`, which the pattern permits) is a distinct value in the equality comparison, but the builder requires
-authentication on every request, so an empty value is likely rejected downstream. Treat "omitted" (VC derives)
-and "explicit empty" as different, and prefer omitting.
+builder. A zero-length `auth_data` is invalid, so omission is the only way to leave it to the VC.
 
 The URL-derived default is the **same** for every builder behind a shared URL, so it cannot tell them apart. To handle that case the operator MUST set an explicit, distinct `auth_data`
 per entry, agreed out of band. The URL-derived default is enough only when the URL fronts a single builder.
