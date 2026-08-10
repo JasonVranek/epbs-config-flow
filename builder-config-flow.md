@@ -27,7 +27,7 @@ explains only what is new relative to the one before it.
 ## Contents
 
 - [The cast](#the-cast)
-- [Example 1: local build only](#example-1-local-build-only)
+- [Example 1: prefer the local build](#example-1-prefer-the-local-build)
 - [Example 2: add p2p bids](#example-2-add-p2p-bids)
 - [Example 3: add one builder-API connection](#example-3-add-one-builder-api-connection)
 - [Example 4: multiple connections and fallbacks](#example-4-multiple-connections-and-fallbacks)
@@ -49,40 +49,41 @@ explains only what is new relative to the one before it.
 
 ---
 
-## Example 1: local build only
+## Example 1: prefer the local build
 
-A key that only ever builds locally. To guarantee this regardless of how the validator client is globally
-configured, set `enabled: false` at the keymanager; it overrides any global builder setup for this key:
+A key that prefers its own build. Configure this at the keymanager with an empty `builders` list and a
+boost of zero; the stored config overrides any global builder setup for this key:
 
 ```jsonc
 // keymanager POST body
-{ "enabled": false }
+{ "builders": [], "builder_boost_factor": "0" }
 ```
 
-With builders disabled the validator client considers **no external bids at all**, neither over the builder
-API nor over p2p, and the proposer builds its own block. None of the machinery in the later examples runs: no
-bid requests, no selection among bids. At block time the VC realizes this by sending no `BuilderConfig` on
-`produceBlockV4` (an omitted body).
+At block time the VC sends the resolved form of this as the `BuilderConfig` body on `produceBlockV4` (the
+body is required). An empty `builders` list requests no builder-API bids, so the only external bids in play
+are those gossiped over p2p, and a boost of `0` means the local build wins the comparison against any of
+them. The proposer simply builds its own block; none of the bid machinery in the later examples decides
+anything. Later examples call this shape the **local-preferred** config.
+
+One edge remains: if the local build is unviable, an external bid MAY win. An operator that wants no
+external payload under any circumstances also sets `min_bid` (the bid floor, detailed in Example 2) to its
+maximum, so every bid dies at the floor even when the local build fails.
 
 ---
 
 ## Example 2: add p2p bids
 
 Now the proposer wants to consider bids seen over the p2p network, but still makes **no builder-API calls**.
-Configure this at the keymanager with `enabled: true` and an empty `builders` list:
+Same empty `builders` list as Example 1, now with a floor and a nonzero boost:
 
 ```jsonc
 // keymanager POST body
 {
-  "enabled": true,
   "builders": [],                // no builder-API bids requested; p2p is the only source
   "min_bid": "10000000",         // floor for p2p bids (Gwei)
   "builder_boost_factor": "110"  // boost for p2p bids; 100 is 1.0x
 }
 ```
-
-An empty `builders` array requests no builder-API bids, so the only bids considered are those arriving over
-p2p.
 
 If you implemented the pre-Gloas `produceBlockV3`, note that `builder_boost_factor` was a query parameter
 there; Gloas moves the bid-selection knobs into this `BuilderConfig` body.
@@ -99,6 +100,8 @@ These two fields set how a bid's value is weighed against the local build:
   above 100 favors the bid. The highest boosted bid competes with the local build **in Gwei**, and the local
   build wins a tie.
 
+Three values mark the endpoints: `0` prefers the local build, `2**64 - 1` prefers the bid, and `100` is profit maximization.
+
 ---
 
 ## Example 3: add one builder-API connection
@@ -111,7 +114,6 @@ The keymanager body the staking software POSTs for one trustless direct connecti
 ```jsonc
 // keymanager POST body
 {
-  "enabled": true,   // false = the VC uses no external bids for this key
   "builders": [
     { "url": "https://builder.example.com",
       "max_execution_payment": "0" }   // 0 = accept no trusted payment; whole payment must be trustless
@@ -131,9 +133,9 @@ beacon node.
 2. **The VC resolves every entry field.** Beacon-side entries are fully resolved: on `produceBlockV4` every
    field is present. The VC fills in `min_bid`, `builder_boost_factor`, `max_execution_payment`, and
    `auth_data` from its own configuration where the entry omitted them.
-3. **Beacon `produceBlockV4`.** The VC calls `produceBlockV4` with the resolved `BuilderConfig` in the body.
-   For each entry the BN calls `getExecutionPayloadBid` at that entry's `url`, forwarding the entry's
-   `auth`.
+3. **Beacon `produceBlockV4`.** The VC calls `produceBlockV4` with the resolved `BuilderConfig` in the
+   body and the `Eth-Consensus-Version` header. For each entry the BN calls `getExecutionPayloadBid` at
+   that entry's `url`, forwarding the entry's `auth`.
 
 ### Request authentication
 
@@ -309,7 +311,6 @@ which value you are looking at. Shown inline:
 ```jsonc
 // keymanager POST body
 {
-  "enabled": true,
   "builders": [
     { "url": "https://builder-b.example.com",
       "builder_pubkey": "0xB...",
@@ -343,7 +344,6 @@ the client default."
 ```jsonc
 // keymanager POST body
 {
-  "enabled": true,
   "builders": [
     { "url": "https://builder-b.example.com",
       "builder_pubkey": "0xB..." }   // omits builder_boost_factor -> inherits 120 (the key default), not the VC global
@@ -382,25 +382,24 @@ per entry, agreed out of band. The URL-derived default is enough only when the U
 In JSON an optional field is simply absent. SSZ has no absence: every field in the container is always
 present, so unset must be a sentinel value: `builder_pubkey` is all zero (not a valid BLS key).
 
-### `enabled: false`, `DELETE`, and the four ways to say "fewer builders"
+### `DELETE` and the three ways to say "fewer builders"
 
-Four distinct states, not synonyms:
+Three distinct stored states, plus deletion, not synonyms:
 
 ```jsonc
-// four keymanager requests, one per state
-{ "enabled": true }                   // omit builders: follow the VC's global config
-{ "enabled": true, "builders": [] }   // builders: []:   no builder-API bids, p2p only
-{ "enabled": false }                  // enabled: false: no builder bids at all
+// three keymanager requests, one per stored state
+{ }                                              // omit builders: follow the VC's global config
+{ "builders": [] }                               // builders: []: no builder-API bids, p2p only
+{ "builders": [], "builder_boost_factor": "0" }  // local-preferred (Example 1)
 // DELETE /eth/v1/validator/{pubkey}/builders  (no body): remove the config
 ```
 
 - **omit `builders`**: this key follows whatever builders the VC is globally configured with.
 - **`builders: []`**: this key uses no builder-API builders; p2p bids remain its only source (Example 2).
-- **`enabled: false`**: this key sources **no** builder bids at all, including from any builders the VC is
-  globally configured with. This is the guaranteed local-build config from Example 1.
+- **`builders: []` with `builder_boost_factor: "0"`**: the local-preferred config from Example 1.
 - **`DELETE`** the config: remove it entirely; the key reverts to the VC's own configuration, exactly as if it
-  had never been configured. A `DELETE` is the absence of a stored config, where `enabled: false` is a stored
-  one.
+  had never been configured. A `DELETE` is the absence of a stored config, where each of the three bodies
+  above is a stored one.
 
 ### Reading the config back
 
@@ -422,6 +421,8 @@ Not everything the flow touches is settled or covered here. Genuinely open, stil
 - **The local build's value.** Selection has a bid "compete with the local build" and the local build win a
   tie, but how the BN derives the local build's value (and in what units it compares) is a BN-internal the
   beacon spec does not pin.
+- **What makes a local build unviable.** The boost semantics lean on local-build viability, but what makes
+  a local build unviable is a BN-internal the spec does not pin.
 - **Boost overflow and builder-vs-builder ties.** The boost's overflow bound (saturate to what type?) and the
   tie-break between two equal top *builder* bids are not pinned; only the local-vs-builder tie is.
 
@@ -440,4 +441,4 @@ The rules most easily gotten wrong:
 | 2 | Omitted `auth_data` is VC-derived from the URL and byte-matched at the builder | The URL-derived value is identical for every builder behind a shared URL, so it cannot tell them apart; set an explicit, distinct `auth_data` per builder | keymanager, builder |
 | 3 | SSZ absence sentinel: all-zero `builder_pubkey` | SSZ has no absence, so unset must be a sentinel value, and the JSON and SSZ forms must agree on what an entry means | beacon |
 | 4 | Top-level `min_bid`/`builder_boost_factor` apply to p2p bids | There is no top-level `max_execution_payment` because a p2p bid carries no trusted `execution_payment` (consensus forces it to `0`) | beacon |
-| 5 | Request auth: genesis **signing domain**, fork-versioned **wire type** | Sign under `compute_domain(DOMAIN_REQUEST_AUTH)` with genesis defaults (never the active fork version, never `DOMAIN_BEACON_BUILDER`), yet the SSZ type is fork-versioned, so `getExecutionPayloadBid` and `submitBuilderPreferences` require the `Eth-Consensus-Version` header | builder |
+| 5 | Request auth: genesis **signing domain**, fork-versioned **wire type** | Sign under `compute_domain(DOMAIN_REQUEST_AUTH)` with genesis defaults (never the active fork version, never `DOMAIN_BEACON_BUILDER`), yet the SSZ type is fork-versioned, so `produceBlockV4`, `getExecutionPayloadBid`, and `submitBuilderPreferences` require the `Eth-Consensus-Version` header | beacon, builder |
