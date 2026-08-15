@@ -1,7 +1,7 @@
 # Per-key builder configuration: a walkthrough from the simplest config up
 
-> **Status.** Reflects three open PRs at these commits: keymanager-APIs @`be0f46e`,
-> beacon-APIs @`71c7315` (#630), builder-specs @`a5552d6` (#165). These branches are still moving; when a
+> **Status.** Reflects three open PRs at these commits: keymanager-APIs @`aa0f2eb`,
+> beacon-APIs @`698d05f` (#630), builder-specs @`82fa559` (#165). These branches are still moving; when a
 > spec changes, this doc is stale until updated. The specs are authoritative: where this doc and a spec
 > disagree, the spec wins.
 
@@ -185,7 +185,7 @@ and the same name is used for both:
 - **BN to builder, per-builder (builder API).** For each entry the BN makes one builder-API
   `submitBuilderPreferences` call to `.../builder_preferences/{proposer_pubkey}` — the proposer pubkey rides
   in the **path** (symmetric with `getExecutionPayloadBid`), not the body. The body is a
-  `BuilderPreferencesRequest` of just `{auth, preferences}`, where `preferences` carries the
+  `BuilderPreferencesRequest` of just `{preferences, auth}`, where `preferences` carries the
   `max_execution_payment`. Each addressed builder responds `202`, `400`, or `401` individually and
   best-effort, and the BN maps those results back onto the batched response above.
 
@@ -334,8 +334,10 @@ only two fields:
 
 - `min_bid`, `builder_boost_factor`: an omitted entry value inherits this key's `BuilderConfig` default, and
   if that is unset too, the VC's own configuration.
-- `max_execution_payment`, `auth_data`: an omitted entry value inherits the VC's own configuration directly;
-  there is no key-level default for these.
+- `max_execution_payment`: an omitted entry value inherits the VC's own configuration directly; there is no
+  key-level default.
+- `auth_data`: an omitted value is set to the UTF-8 bytes of the entry's `url`, verbatim; there is no VC
+  default to inherit.
 - `builder_pubkeys`: an omitted value resolves to the empty list; there is no default to inherit.
 
 The key-level default is the footgun: if an operator sets a key-level `builder_boost_factor` but omits it on
@@ -367,8 +369,9 @@ cannot use yields no bid but MUST NOT fail the request, so one bad entry never c
 
 When omitted, `auth_data` is VC-derived from the URL (the SHOULD convention from Example 3: UTF-8 bytes of the
 URL exactly as advertised, hex-encoded). "Exactly as advertised" is the canonicalization rule (no
-normalization); any divergence between what the VC signs and what the builder expects is a `400` at the
-builder. A zero-length `auth_data` is invalid, so omission is the only way to leave it to the VC.
+normalization). A divergence between what the VC signs and what the builder expects fails the builder's
+`auth.message.data` check, a `400`; a `401` is the signature itself failing to verify. A zero-length
+`auth_data` is invalid, so omission is the only way to leave it to the VC.
 
 The URL-derived default is the **same** for every builder behind a shared URL, so it cannot tell them apart. To handle that case the operator MUST set an explicit, distinct `auth_data`
 per entry, agreed out of band. The URL-derived default is enough only when the URL fronts a single builder.
@@ -382,15 +385,20 @@ Three distinct stored states, plus deletion, not synonyms:
 { }                                              // omit builders: follow the VC's global config
 { "builders": [] }                               // builders: []: no builder-API bids, p2p only
 { "builders": [], "builder_boost_factor": "0" }  // local-preferred (Example 1)
+{ "builders": [], "min_bid": "18446744073709551615" }  // local only: the max floor kills p2p bids too
 // DELETE /eth/v1/validator/{pubkey}/builders  (no body): remove the config
 ```
 
-- **omit `builders`**: this key follows whatever builders the VC is globally configured with.
+- **omit `builders`**: this key follows whatever builders the VC is globally configured with; any key-level
+  `min_bid` or `builder_boost_factor` still applies to those entries.
 - **`builders: []`**: this key uses no builder-API builders; p2p bids remain its only source (Example 2).
 - **`builders: []` with `builder_boost_factor: "0"`**: the local-preferred config from Example 1.
+- **`builders: []` with the maximum `min_bid`**: local only; the floor also rejects every p2p bid, the
+  strict never-external lever from Example 2.
 - **`DELETE`** the config: remove it entirely; the key reverts to the VC's own configuration, exactly as if it
-  had never been configured. A `DELETE` is the absence of a stored config, where each of the three bodies
-  above is a stored one.
+  had never been configured. A `DELETE` is the absence of a stored config, where each of the bodies above is
+  a stored one. A `POST` of `{}` with no other fields resolves identically to having no config, so it is
+  behaviorally equivalent to `DELETE`; they differ only in whether a config is stored.
 
 ### Reading the config back
 
@@ -402,20 +410,16 @@ back in; do not echo the resolved value.
 
 ---
 
-## Open questions and out of scope
+## Client-defined behavior and out of scope
 
-Not everything the flow touches is settled or covered here. Genuinely open, still being worked in the specs:
+Deliberately left to the client:
 
-- **Cap granularity.** `max_execution_payment` is per-entry (so per-URL), but `submitBuilderPreferences` is
-  per-proposer-key. Which cap is communicated to a builder reachable at two URLs with two different caps is not
-  pinned; the per-entry cap is the authoritative BN backstop regardless.
-- **The local build's value.** Selection has a bid "compete with the local build" and the local build win a
-  tie, but how the BN derives the local build's value (and in what units it compares) is a BN-internal the
-  beacon spec does not pin.
-- **What makes a local build unviable.** The boost semantics lean on local-build viability, but what makes
-  a local build unviable is a BN-internal the spec does not pin.
-- **Boost overflow and builder-vs-builder ties.** The boost's overflow bound (saturate to what type?) and the
-  tie-break between two equal top *builder* bids are not pinned; only the local-vs-builder tie is.
+- **What makes a local build unviable.** The boost semantics lean on local-build viability, but the
+  spec leaves "unless an error makes it unviable" undefined, exactly as v3 does.
+- **Boost overflow width and builder-vs-builder ties.** Saturating arithmetic is mandated but the
+  saturation width is not, matching v3's shipped looseness; the tie-break between two equal top
+  *builder* bids is a free client choice. Only the local-vs-builder tie is pinned, in the local
+  build's favor.
 
 Deliberately out of scope: consensus-spec bid construction and validity (`is_eligible_for_bid`, `gas_limit`,
 collateral coverage), the PTC and gossip mechanics, blobs and KZG, the full contents of `ProposerPreferences`,
